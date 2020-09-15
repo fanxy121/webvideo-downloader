@@ -1,6 +1,4 @@
 # -*- coding:utf-8 -*-
-import os
-import sys
 import tools
 
 
@@ -46,3 +44,5 @@ tempFilePath = "../temp/"
 # 视频文件保存路径
 videoFilePath = "../videos/"
 
+# 日志保存路径
+logPath = './logs/'

@@ -2,18 +2,22 @@
 // @name 网站视频下载器
 // @namespace https://github.com/jaysonlong
 // @author Jayson Long https://github.com/jaysonlong
-// @version 1.3
+// @version 1.6.2
 // @match *://www.bilibili.com/*/play/*
 // @match *://www.bilibili.com/video/*
-// @match *://www.iqiyi.com/*.html
+// @match *://www.bilibili.com/s/video/*
+// @match *://www.iqiyi.com/*.html*
+// @match *://tw.iqiyi.com/*.html*
+// @match *://www.iq.com/play/*
 // @match *://v.qq.com/x/cover/*
 // @match *://v.qq.com/x/page/*
+// @match *://wetv.vip/*
 // @match *://www.mgtv.com/b/*
 // @require https://unpkg.com/ajax-hook@2.0.0/dist/ajaxhook.min.js
 // @require https://cdn.bootcdn.net/ajax/libs/draggabilly/2.3.0/draggabilly.pkgd.min.js
 // @require https://cdn.bootcdn.net/ajax/libs/limonte-sweetalert2/8.11.8/sweetalert2.all.min.js
 // @run-at document-start
-// @grant GM_info
+// @grant GM_xmlhttpRequest
 // @inject-into page
 // @downloadURL https://github.com/jaysonlong/webvideo-downloader/raw/master/violentmonkey/WebVideoDownloader.user.js
 // @homepageURL https://github.com/jaysonlong/webvideo-downloader
@@ -22,10 +26,12 @@
 
 var storage = {
   // 通用
-  serverUrl: 'ws://127.0.0.1:18888',
+  serverAddr: '127.0.0.1:18888',
+  remoteCallType: 'http', // http || websocket
+
   cbFn: {},
   downloadBtn: null,
-  downloadModal: null,
+  modalInfo: null,
   playinfoUrl: null,
 
   // bilibili
@@ -35,8 +41,6 @@ var storage = {
   playinfoMethod: null,
   playinfoBody: null,
 };
-
-var domains = ['bilibili.com', 'iqiyi.com', 'qq.com', 'mgtv.com'];
 
 var handler = {
   'bilibili.com': function() {
@@ -76,6 +80,19 @@ var handler = {
     });
   },
 
+  'iq.com': function() {
+    ajaxHook({
+      open: function([_, url]) {
+        if (url.indexOf('dash?') > 0) {
+          storage.playinfoUrl = url;
+          fetch(url, {
+            credentials: 'include'
+          }).then(resp => resp.json()).then(iqiyi_parseResult);
+        }
+      }
+    });
+  },
+
   'qq.com': function() {
     ajaxHook({
       open: ([method, url], xhr) => {
@@ -83,7 +100,7 @@ var handler = {
         xhr.url = url;
       },
       send: ([body], xhr) => {
-        if (xhr.url.indexOf('qq.com/proxyhttp') > 0 && body.indexOf('vinfoparam') > 0) {
+        if (xhr.url.includes('qq.com/proxyhttp') && body.includes('vinfoparam')) {
           xhr.body = body;
         }
       },
@@ -100,13 +117,20 @@ var handler = {
     });
   },
 
+  'wetv.vip': function() {
+    jsonpHook('getvinfo?', wetv_parseResult, {
+      onMatch: url => storage.playinfoUrl = url,
+    });
+  },
+
   'mgtv.com': function() {
     jsonpHook('getSource?', mgtv_parseResult);
   },
 }
 
 prepare();
-domains.some(domain => {
+
+Object.keys(handler).some(domain => {
   if (location.href.indexOf(domain) != -1) {
     handler[domain]();
     return true;
@@ -135,7 +159,7 @@ async function bilibili_parseResult(rs) {
     sessCookie = sessCookie.length ? sessCookie[0] : '';
 
     var url = `${pageUrl}|${playinfoBaseUrl}|${sessCookie}`;
-    var tips = sessCookie ? '' : '未登录或cookie中的SESSDATA项的HttpOnly属性为true，只能获取低清晰度版本';
+    var tips = sessCookie ? '' : '未登录或cookie中的SESSDATA项的HttpOnly属性为true，不一定支持最高清晰度';
     htmls.push(`${tips}  ${createLink(url, 'remote multi')}`);
   } else {
     htmls.push(createLink(location.href, 'remote multi'));
@@ -204,10 +228,12 @@ function iqiyi_parseResult(rs) {
   $.logEmphasize('VideoInfo', rs);
 
   var videos = rs.data.program.video.filter(each => each.m3u8 != undefined);
+  if (!videos.length) {
+    videos = rs.data.program.video.filter(each => each.fs != undefined);
+  }
+
   if (videos.length) {
     var {
-      vid,
-      m3u8,
       vsize: size,
       ff: fileformat,
       scrsz: wh,
@@ -238,7 +264,10 @@ function tencent_parseResult(rs) {
         method: storage.playinfoMethod,
       })
       .then(resp => resp.json())
-      .then(data => ({ defDesc, data }))
+      .then(async data => {
+        var rs = await tencent_parseVideoInfo(data);
+        return Object.assign(rs, { defDesc });
+      })
       .then(resolve);
   }));
 
@@ -246,8 +275,8 @@ function tencent_parseResult(rs) {
     var html = '';
     rsList.forEach(each => {
       try {
-        var { url, width, height, size } = tencent_parseVideoInfo(each.data);
-        html += `${width}x${height}  ${each.defDesc}  ${size}M  ${createLink(url)}\n`;
+        var { url, width, height, size, defDesc } = each;
+        html += `${width}x${height}  ${defDesc}  ${size}M  ${createLink(url)}\n`;
       } catch (e) {}
     })
 
@@ -259,13 +288,92 @@ function tencent_parseResult(rs) {
 }
 
 // 腾讯视频: 解析视频信息
-function tencent_parseVideoInfo(data) {
+async function tencent_parseVideoInfo(data) {
   var vinfo = JSON.parse(data.vinfo);
   var vi = vinfo.vl.vi[0];
   var ui = vi.ul.ui[0];
   var url = ui.url;
+  if (!url.includes('.m3u8')) {
+    if (ui.hls) {
+      url += ui.hls.pt;
+    } else if (vi.cl.fc > 0) {
+      var fragCnt = vi.cl.fc;
+      var [vid, mname, suffix] = vi.fn.split('.');
+      var [_, defId, _] = vi.cl.ci[0].keyid.split('.');
+      var tasks = Array.apply(null, {length: fragCnt}).map(async (e, i) => {
+        var fname = `${vid}.${mname}.${i+1}.${suffix}`;
+        var body = JSON.parse(storage.playinfoBody);
+        body.buid = 'onlyvkey';
+        body.vkeyparam = `${body.vinfoparam}&format=${defId}&filename=${fname}`;
+        body.adparam = body.vinfoparam = undefined;
+
+        var fragUrl = await fetch(storage.playinfoUrl, {
+            body: JSON.stringify(body),
+            method: storage.playinfoMethod,
+          })
+          .then(resp => resp.json())
+          .then(async data => {
+            data = JSON.parse(data.vkey);
+            return `${url}${fname}?vkey=${data.key}`;
+          });
+        return fragUrl;
+      });
+      var fragUrls = await Promise.all(tasks);
+      url = fragUrls.join('|');
+    } else {
+      url += `${vi.fn}?vkey=${vi.fvkey}`;
+    }
+  }
   var { vw: width, vh: height, fs: size } = vi;
   size = Math.floor(size / 1024 / 1024);
+  return { url, width, height, size }
+}
+
+// WeTV: 获取视频链接
+function wetv_parseResult(rs) {
+  $.logEmphasize('VideoInfo', rs);
+
+  var tasks = rs.fl.fi.map(each => new Promise(resolve => {
+    var { name: defn, cname: defDesc } = each;
+    var url = storage.playinfoUrl.replace(/defn=[^&]*/, 'defn=' + defn);
+
+    $.jsonp(url).then(rs => {
+      var data = wetv_parseVideoInfo(rs);
+      return Object.assign(data, { defDesc });
+    }).then(resolve);
+  }));
+
+
+  Promise.all(tasks).then(rsList => {
+    var html = '';
+    rsList.forEach(each => {
+      try {
+        var { url, width, height, size, defDesc } = each;
+        html += `${width}x${height}  ${defDesc}  ${size}M  ${createLink(url)}\n`;
+      } catch (e) {}
+    })
+
+    updateModal({
+      title: document.title,
+      content: html,
+    });
+  });
+}
+
+// WeTV: 解析视频信息
+function wetv_parseVideoInfo(vinfo) {
+  var vi = vinfo.vl.vi[0];
+  var ui = vi.ul.ui[0];
+  var url = ui.url;
+  if (url.indexOf('.m3u8') == -1) {
+    url += ui.hls.pt;
+  }
+  var srts = vinfo.sfl.fi.filter(each => each.url);
+  var srtsInfo = srts.map(each => each.name + '|' + each.url);
+  url += '|' + srtsInfo.join('|');
+  var { vw: width, vh: height, fs: size } = vi;
+  size = Math.floor(size / 1024 / 1024);
+
   return { url, width, height, size }
 }
 
@@ -315,55 +423,99 @@ function mgtv_parseVideoInfo(rs) {
   return { width, height, size }
 }
 
-// 调用下载器创建任务
-async function remoteCall(url, multi) {
-  var ws = new WebSocket(storage.serverUrl);
-  ws.onerror = function() {
-    Swal.fire({
-      type: 'error',
-      title: '请先运行 "python daemon.py"',
-    });
-  };
-  ws.onopen = function() {
-    var queue = [{title:'输入文件名', inputValue: storage.downloadModal.title}];
-    multi && queue.push('输入首、尾P(空格分隔)或单P');
-    Swal.mixin({
-      input: 'text',
-      showCancelButton: true,
-      confirmButtonText: '<i class="fa fa-arrow-right"></i>',
-      cancelButtonText: '<i class="fa fa-times"></i>',
-      progressSteps: Object.keys(queue).map(idx => parseInt(idx) + 1),
-    }).queue(queue).then((result) => {
-      if (result.value) {
-        var payload = {
-          fileName: result.value[0],
-          pRange: result.value[1],
-          linksurl: url,
-          type: 'link',
-        }
-        ws.send(JSON.stringify(payload));
-        ws.onmessage = e => {
-          var [type, title] = ['success', '任务已创建'];
-          if (e.data != 'success') {
-            [type, title] = ['error', '创建任务失败'];
-          }
-          Swal.fire({
-            type,
-            title,
-            position: 'top-end',
-            showConfirmButton: false,
-            timer: 1000
-          });
-          ws.close();
-        }
+// 准备下载信息
+function prepareDownload(url, multi) {
+  var queue = [{title:'输入文件名', inputValue: storage.modalInfo.title}];
+  multi && queue.push('输入首、尾P(空格分隔)或单P');
+  Swal.mixin({
+    input: 'text',
+    showCancelButton: true,
+    confirmButtonText: '<i class="fa fa-arrow-right"></i>',
+    cancelButtonText: '<i class="fa fa-times"></i>',
+    progressSteps: Object.keys(queue).map(idx => parseInt(idx) + 1),
+  }).queue(queue).then((result) => {
+    if (result.value) {
+      var payload = {
+        fileName: result.value[0],
+        pRange: result.value[1],
+        linksurl: url,
+        type: 'link',
       }
-    })
-  };
+
+      var remoteCallHandler;
+      if (storage.remoteCallType == 'websocket') {
+        remoteCallHandler = wsCall;
+      } else if (storage.remoteCallType == 'http') {
+        remoteCallHandler = httpCall;
+      } else {
+        remoteCallHandler = httpCall;
+      }
+
+      // 创建下载任务
+      remoteCallHandler(payload).then(msg => {
+        Swal.fire({
+          type: 'success',
+          title: msg,
+          position: 'top-end',
+          showConfirmButton: false,
+          timer: 1000
+        });
+      }).catch(msg => {
+        Swal.fire({
+          type: 'error',
+          title: msg,
+        });
+      });
+    }
+  })
+}
+
+// http调用，不受CSP和Mixed Content限制
+function httpCall(payload) {
+  return new Promise((resolve, reject) => {
+    GM_xmlhttpRequest({
+      method: "POST",
+      url: 'http://' + storage.serverAddr,
+      data: JSON.stringify(payload),
+      timeout: 1000,
+      onload: function(res) {
+        if (res.response == 'success') {
+          resolve('任务已创建');
+        } else {
+          reject('创建任务失败');
+        }
+      },
+      ontimeout: function() {
+        reject('请先运行 "python daemon.py"');
+      }
+    });
+  });
+}
+
+// websocket调用，受CSP和Mixed Content限制，但本地服务器不受影响；支持MSE流传输
+function wsCall(payload) {
+  return new Promise((resolve, reject) => {
+    var ws = new WebSocket('ws://' + storage.serverAddr);
+    ws.onerror = function() {
+      reject('请先运行 "python daemon.py"');
+    };
+    ws.onopen = function() {
+      ws.send(JSON.stringify(payload));
+      ws.onmessage = e => {
+        if (e.data == 'success') {
+          resolve('任务已创建');
+        } else {
+          resolve('创建任务失败');
+        }
+        ws.close();
+      }
+    };
+  });
 }
 
 // 更新下载内容（设置模态框的标题和正文）
 function updateModal({title, content}) {
-  storage.downloadModal = {title, content};
+  storage.modalInfo = {title, content};
   if (storage.downloadBtn) return;
 
   storage.downloadBtn = $.create('div', {
@@ -374,8 +526,8 @@ function updateModal({title, content}) {
   var draggie = new Draggabilly(storage.downloadBtn);
   draggie.on('staticClick', e => {
     Swal.fire({
-      title: storage.downloadModal.title,
-      html: storage.downloadModal.content,
+      title: storage.modalInfo.title,
+      html: storage.modalInfo.content,
       customClass: {
         container: 'dl-modal',
         title: 'dl-modal-title',
@@ -387,7 +539,7 @@ function updateModal({title, content}) {
     });
     $('.dl-modal')[0].on('click', '.remote', e => {
       e.preventDefault();
-      remoteCall(e.target.href, e.target.classList.contains('multi'));
+      prepareDownload(e.target.href, e.target.classList.contains('multi'));
     });
   });
 }
@@ -407,39 +559,48 @@ function ajaxHook() {
 }
 
 // jsonp拦截
-function jsonpHook(urlKey, cbFunc, cbKey = 'callback') {
-  document._createElement = document.createElement;
-  document.createElement = function(type) {
-    var ele = document._createElement(type);
-    if (type.toLowerCase() == 'script') {
-      setTimeout(() => {
-        if (ele.src.indexOf(urlKey) > 0) {
-          var cbName = ele.src.match(new RegExp(cbKey + '=([^&]+)'))[1];
-          if (!storage.cbFn[cbName]) {
-            storage.cbFn[cbName] = unsafeWindow[cbName];
-            Object.defineProperty(unsafeWindow, cbName, {
-              get: () => {
-                if (!storage.cbFn[cbName]) {
-                  return undefined;
-                }
-                return (rs) => {
-                  try {
-                    cbFunc(rs);
-                  } catch (e) {}
-                  storage.cbFn[cbName](rs);
-                };
-              },
-              set: (fn) => {
-                storage.cbFn[cbName] = fn;
-              }
-            });
-          }
-        }
+function jsonpHook(urlKey, cbFunc, options = {}) {
+  var { cbParamName = 'callback', once = false, onMatch } = options;
+  var handled = false;
 
-      }, 0);
+  document.createElement = new Proxy(document.createElement, {
+    apply: function(fn, thisArg, [tagName]) {
+      var ele = fn.apply(thisArg, [tagName]);
+
+      if (tagName.toLowerCase() == 'script') {
+        setTimeout(() => {
+          if (ele.src.indexOf(urlKey) > 0) {
+            if (once && handled) return;
+            handled = true;
+            onMatch && onMatch(ele.src);
+
+            var cbName = ele.src.match(new RegExp(cbParamName + '=([^&]+)'))[1];
+            if (!storage.cbFn[cbName]) {
+              storage.cbFn[cbName] = unsafeWindow[cbName];
+              Object.defineProperty(unsafeWindow, cbName, {
+                get: () => {
+                  if (!storage.cbFn[cbName]) {
+                    return undefined;
+                  }
+                  return (rs) => {
+                    try {
+                      cbFunc(rs);
+                    } catch (e) {}
+                    storage.cbFn[cbName](rs);
+                  };
+                },
+                set: (fn) => {
+                  storage.cbFn[cbName] = fn;
+                }
+              });
+            }
+          }
+
+        }, 0);
+      }
+      return ele;
     }
-    return ele;
-  }
+  });
 }
 
 // 元素选择器
@@ -450,6 +611,9 @@ function $(selector, filterFn = null) {
 
 // 初始化工作
 function prepare() {
+  unsafeWindow.webvideo_downloader_exist = true;
+  document.originCreateElement = document.createElement;
+
   Object.assign($, {
     create: function(tagName, attrs = {}) {
       var ele = document.createElement(tagName);
@@ -461,9 +625,6 @@ function prepare() {
     },
     ready: function(callback) {
       document.addEventListener("DOMContentLoaded", callback);
-    },
-    load: function(callback) {
-      window.addEventListener('load', callback);
     },
     addStyle: function(source) {
       if (source.startsWith('http')) {
@@ -479,15 +640,25 @@ function prepare() {
         })
       }
     },
-    jsonp: function(url, cbKey = 'callback') {
+    jsonp: function(url, skipHook = true, cbParamName = 'callback') {
       $.counter = $.counter ? $.counter + 1 : 1;
       var cbName = 'jaysonCb' + $.counter;
 
       return new Promise(resolve => {
-        var script = $.create('script', {
-          src: `${url}&${cbKey}=${cbName}`,
-          appendToBody: true,
-        });
+        var src;
+        if (url.includes(cbParamName + '=')) {
+          src = url.replace(new RegExp(`${cbParamName}=[^&]*`), `${cbParamName}=${cbName}`);
+        } else {
+          src = `${url}&${cbParamName}=${cbName}`
+        }
+        if (skipHook) {
+
+        }
+        var createMethod = skipHook ? 'originCreateElement' : 'createElement'
+        var script = document[createMethod]('script');
+        script.src = src;
+        document.body.appendChild(script);
+
         unsafeWindow[cbName] = function(data) {
           resolve(data);
           script.remove();
@@ -533,8 +704,19 @@ function prepare() {
   });
 
   $.ready(() => {
+    $.create('i', { 
+      className: 'fa fa-arrow-right fa-times', 
+      style: 'visibility:hidden;height:0;width:0;', 
+      appendToBody: true,
+    });
     $.addStyle('https://cdn.bootcdn.net/ajax/libs/font-awesome/4.0.0/css/font-awesome.min.css');
     $.addStyle(`
+      .swal2-container {
+        font-size: 18px;
+      }
+      .swal2-modal {
+        font-size: 1em;
+      }
       #dl-btn {
         z-index: 1000;
         position: fixed;
@@ -543,6 +725,7 @@ function prepare() {
         width: 50px;
         height: 50px;
         line-height: 50px;
+        font-size: 12px;
         border-radius: 50%;
         border: #fff solid 1.5px;
         box-shadow: 0 3px 10px rgb(48, 133, 214);
@@ -566,7 +749,7 @@ function prepare() {
       .dl-modal-content {
         font-size: 15px;
         line-height: 30px;
-        white-space: pre;
+        white-space: pre-wrap;
       }
       .dl-modal-content a {
         color: blue;

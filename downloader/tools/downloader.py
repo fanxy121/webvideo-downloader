@@ -1,17 +1,12 @@
 # -*- coding:utf-8 -*-
 import time
-import sys
 import math
-import traceback
 from concurrent.futures import ThreadPoolExecutor
-from colorama import init 
-import requests
+from requests.exceptions import RequestException
 from . import utils
 
 
-init(autoreset=True)
-
-CONN_CLOSE_EXCEPTION = Exception('Connection closed')
+CLIENT_CLOSE_EXCEPTION = Exception('Connection closed')
 
 # 自定义线程池
 class MyThreadPool(ThreadPoolExecutor):
@@ -94,10 +89,9 @@ class WebDownloader:
         speed = utils.formatSize(int(averSize * 2))
         usedTime = utils.formatTime(time.time() - self.startTime)
 
-        sys.stdout.write("\r进度: \033[92m[%s]\033[0m %2d%% %s %6s/s %s  " % (
+        print("\r进度: \033[92m[%s]\033[0m %2d%% %s %6s/s %s  " % (
             barStr, percent, progress, speed, usedTime
-        ))
-        sys.stdout.flush()
+        ), end='')
 
     # 非阻塞等待下载完成，并实时更新下载进度
     def _waitUtilFinish(self):
@@ -119,12 +113,14 @@ class WebDownloader:
             headers = headers.copy()
             end = ('%d' % end) if isinstance(end, int) else ''
             downloadedSize = 0
+            rangeSize = None
             response = None
 
             while True:
                 try:
                     headers['Range'] = 'bytes=%d-%s' % (start + downloadedSize, end)
                     response = utils.request("GET", url, headers=headers, stream=True)
+                    rangeSize = rangeSize or int(response.headers['Content-Length'])
 
                     if response.status_code != 206 and not (start == 0 and end == ''):
                         raise Exception('服务器不支持Range请求')
@@ -135,8 +131,12 @@ class WebDownloader:
                         f.write(chunk)
                         downloadedSize += len(chunk)
                         self.currSize += len(chunk)
-                    break
-                except requests.exceptions.RequestException:
+
+                    if downloadedSize < rangeSize:
+                        continue
+                    else:
+                        break
+                except RequestException:
                     if response and response.status_code != 206:
                         f.seek(start)
                         self.currSize -= downloadedSize
@@ -145,7 +145,7 @@ class WebDownloader:
 
                         if not self.hasWarned and self.failedSize > self.currSize * 0.5:
                             self.hasWarned = True
-                            print('\n警告: \033[93m当前下载失败几率较高，且服务器不支持断点续传，' \
+                            print('\n\033[93m警告: 当前下载失败几率较高，且服务器不支持断点续传，' \
                                 + '可尝试降低下载线程数量以提高下载速度，命令行参数: -t:h N\033[0m')
 
     def directDownload(self, url, fileName, headers):
@@ -177,7 +177,7 @@ class WebDownloader:
         self._reset(fileName, utils.getFileSize(url, headers))
         fragmentCnt = max(threadCnt, fragmentCnt)
         fragmentSize = math.ceil(self.totalSize / fragmentCnt)
-
+        
         self.threadPool.reset(max_workers=threadCnt)
         for i in range(fragmentCnt):
             start, end = fragmentSize * i, fragmentSize * (i + 1) - 1
@@ -215,7 +215,7 @@ class WebDownloader:
                 if data is None:
                     continue
                 elif isinstance(data, BaseException):
-                    if data == CONN_CLOSE_EXCEPTION:
+                    if data == CLIENT_CLOSE_EXCEPTION:
                         break
                     raise data
                 elif data['type'] == 'video':
